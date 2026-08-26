@@ -1,0 +1,31 @@
+# Secrets (spec.md section 4.1 -- .env.example IS committed, real .env never is)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated data artifacts (spec.md: raw PDFs are downloaded separately per
+# README, everything else here is produced by make ingest/ground-truth/
+# eval-retrieval -- none of it is source, none of it should be committed)
+data/raw/*
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/ground_truth.csv
+data/retrieval_eval_results.json
+data/retrieval_eval_results.csv
+
+# ONNX model exports (regenerated via `make export-models`)
+models/
+
+# OS junk
+Thumbs.db
+.DS_Store
