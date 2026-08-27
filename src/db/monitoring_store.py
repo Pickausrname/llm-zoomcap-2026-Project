@@ -34,12 +34,18 @@ __all__ = [
     "init_db",
     "insert_conversation",
     "insert_feedback",
+    "insert_llm_eval_run",
 ]
 
 # Special SQLite DSN for an ephemeral, on-disk-free database (tests, etc.).
 _MEMORY_DB: Final[str] = ":memory:"
 
-_VALID_FEEDBACK_SOURCES: Final[frozenset[str]] = frozenset({"user", "judge"})
+# "eval_judge" (spec.md section 11.4, evaluation/evaluate_llm.py) is a
+# DISTINCT source from "judge" (spec.md section 10.2, rag/judge.py's live
+# production relevance judge) -- kept separate so an offline A/Q/A' benchmark
+# run never blends into a "judge score over time" dashboard query over real
+# production traffic. See /memories/repo/project-notes.md for the rationale.
+_VALID_FEEDBACK_SOURCES: Final[frozenset[str]] = frozenset({"user", "judge", "eval_judge"})
 
 # ---------------------------------------------------------------------------
 # Schema DDL
@@ -69,7 +75,7 @@ _CREATE_FEEDBACK_TABLE_SQL: Final[str] = """
 CREATE TABLE IF NOT EXISTS feedback (
     id              INTEGER PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations (id) ON DELETE CASCADE,
-    source          TEXT NOT NULL CHECK (source IN ('user', 'judge')),
+    source          TEXT NOT NULL CHECK (source IN ('user', 'judge', 'eval_judge')),
     score           INTEGER,
     label           TEXT,
     explanation     TEXT,
@@ -80,6 +86,25 @@ CREATE TABLE IF NOT EXISTS feedback (
 _CREATE_FEEDBACK_INDEX_SQL: Final[str] = """
 CREATE INDEX IF NOT EXISTS idx_feedback_conversation_id
     ON feedback (conversation_id);
+"""
+
+# One row per (model, run_timestamp) per `make eval-llm` invocation (spec.md
+# section 11.4). Rows are always INSERTED, never overwritten/upserted -- this
+# is the durable history backing a future "eval score over time" view, unlike
+# evaluate_llm.py's own JSON/CSV outputs, which are atomically overwritten on
+# every run (correct for "current result", useless for trend history).
+_CREATE_LLM_EVAL_RUNS_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS llm_eval_runs (
+    id            INTEGER PRIMARY KEY,
+    model         TEXT NOT NULL,
+    run_timestamp TEXT NOT NULL,
+    accuracy      REAL NOT NULL,
+    total_cost    REAL NOT NULL,
+    avg_latency   REAL NOT NULL,
+    n_samples     INTEGER NOT NULL,
+    n_failures    INTEGER NOT NULL,
+    is_winner     INTEGER NOT NULL CHECK (is_winner IN (0, 1))
+);
 """
 
 
@@ -165,6 +190,7 @@ def init_db(db_path: str | Path = MONITORING_DB) -> None:
         conn.execute(_CREATE_CONVERSATIONS_TABLE_SQL)
         conn.execute(_CREATE_FEEDBACK_TABLE_SQL)
         conn.execute(_CREATE_FEEDBACK_INDEX_SQL)
+        conn.execute(_CREATE_LLM_EVAL_RUNS_TABLE_SQL)
         conn.commit()
 
     logger.info("Monitoring store schema initialized at %s", db_path)
@@ -268,11 +294,15 @@ def insert_feedback(
 
     Args:
         conversation_id: FOREIGN KEY into ``conversations.id``.
-        source: ``"user"`` or ``"judge"``.
+        source: ``"user"``, ``"judge"`` (live production relevance judge,
+            spec.md section 10.2), or ``"eval_judge"`` (offline A/Q/A'
+            benchmark judge, spec.md section 11.4 -- kept distinct from
+            ``"judge"`` so the two never blend in a dashboard query).
         score: ``+1``/``-1`` for user feedback, or a mapped numeric
-            value for judge feedback (spec.md section 9.2). Nullable.
+            value for judge/eval_judge feedback. Nullable.
         label: Judge verdict (``RELEVANT``/``PARTLY_RELEVANT``/
-            ``NON_RELEVANT``). Nullable, unused for user feedback.
+            ``NON_RELEVANT`` for ``"judge"``; ``"good"``/``"bad"`` for
+            ``"eval_judge"``). Nullable, unused for user feedback.
         explanation: Judge reasoning. Nullable, unused for user feedback.
         db_path: Path to the monitoring store SQLite file. Defaults to
             ``config.MONITORING_DB``.
@@ -281,7 +311,8 @@ def insert_feedback(
         The autoincremented id of the new feedback row.
 
     Raises:
-        ValueError: If ``source`` is not ``"user"`` or ``"judge"``.
+        ValueError: If ``source`` is not one of ``"user"``/``"judge"``/
+            ``"eval_judge"``.
     """
     if source not in _VALID_FEEDBACK_SOURCES:
         raise ValueError(
@@ -306,6 +337,74 @@ def insert_feedback(
         # Should be unreachable (INSERT always assigns a rowid); guard survives `python -O`.
         raise RuntimeError("Failed to retrieve autoincremented feedback_id from SQLite insert.")
     return feedback_id
+
+
+def insert_llm_eval_run(
+    model: str,
+    run_timestamp: str,
+    accuracy: float,
+    total_cost: float,
+    avg_latency: float,
+    n_samples: int,
+    n_failures: int,
+    is_winner: bool,
+    db_path: str | Path = MONITORING_DB,
+) -> int:
+    """
+    Insert one ``llm_eval_runs`` row (spec.md section 11.4).
+
+    One row per ``(model, run_timestamp)`` per ``evaluate_llm.py``
+    (``make eval-llm``) invocation. Rows are always INSERTED, never
+    overwritten/upserted -- this table is the durable run history
+    backing a future "eval score over time" view, unlike
+    ``evaluate_llm.py``'s own JSON/CSV outputs, which are atomically
+    overwritten on every run. Opens and closes its own connection,
+    making this safe to call concurrently from multiple threads.
+
+    Args:
+        model: The LLM provider evaluated (``"openai"``/``"gemini"``).
+        run_timestamp: Timezone-aware UTC ISO-8601 timestamp shared by
+            every model's row from the same evaluation run.
+        accuracy: Fraction (0.0-1.0) of judged answers verdicted "good".
+        total_cost: Total USD cost (generation + judge calls) for this
+            model's run.
+        avg_latency: Mean generation ``latency_seconds`` across
+            successfully generated rows.
+        n_samples: Number of ground-truth rows attempted for this model.
+        n_failures: Number of rows where generation or judging raised.
+        is_winner: Whether this model was selected as the run's winner.
+        db_path: Path to the monitoring store SQLite file. Defaults to
+            ``config.MONITORING_DB``.
+
+    Returns:
+        The autoincremented id of the new ``llm_eval_runs`` row.
+    """
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO llm_eval_runs (
+                model, run_timestamp, accuracy, total_cost, avg_latency,
+                n_samples, n_failures, is_winner
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                model,
+                run_timestamp,
+                accuracy,
+                total_cost,
+                avg_latency,
+                n_samples,
+                n_failures,
+                int(is_winner),
+            ),
+        )
+        conn.commit()
+        run_id = cursor.lastrowid
+
+    if run_id is None:
+        # Should be unreachable (INSERT always assigns a rowid); guard survives `python -O`.
+        raise RuntimeError("Failed to retrieve autoincremented id from llm_eval_runs insert.")
+    return run_id
 
 
 if __name__ == "__main__":

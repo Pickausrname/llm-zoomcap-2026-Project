@@ -22,6 +22,8 @@ data/*.db-shm
 data/ground_truth.csv
 data/retrieval_eval_results.json
 data/retrieval_eval_results.csv
+data/llm_eval_results.json
+data/llm_eval_results.csv
 
 # ONNX model exports (regenerated via `make export-models`)
 models/

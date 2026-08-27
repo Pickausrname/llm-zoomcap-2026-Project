@@ -42,6 +42,8 @@ MONITORING_DB: Path = DATA_DIR / "monitoring.db"
 GROUND_TRUTH_CSV: Path = DATA_DIR / "ground_truth.csv"
 RETRIEVAL_EVAL_RESULTS_JSON: Path = DATA_DIR / "retrieval_eval_results.json"
 RETRIEVAL_EVAL_RESULTS_CSV: Path = DATA_DIR / "retrieval_eval_results.csv"
+LLM_EVAL_RESULTS_JSON: Path = DATA_DIR / "llm_eval_results.json"
+LLM_EVAL_RESULTS_CSV: Path = DATA_DIR / "llm_eval_results.csv"
 
 # ---------------------------------------------------------------------------
 # Model identifiers (spec.md sections 2, 6.2, 7.1)

@@ -24,7 +24,7 @@ from src.retrieval.pipeline import retrieve
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["GeneratedAnswer", "generate_answer"]
+__all__ = ["GeneratedAnswer", "generate_answer", "GENERATION_FAILURE_MODEL"]
 
 _SYSTEM_PROMPT = (
     "You are a MOSFET selection assistant. Answer ONLY using the "
@@ -41,10 +41,12 @@ _NO_CONTEXT_MESSAGE = "No matching MOSFET datasheet content was retrieved for th
 
 # Returned (and still logged to monitoring) when the LLM call fails outright, so a
 # provider outage never crashes generate_answer() nor loses telemetry visibility into it.
+# Public (not `_`-prefixed) so callers like evaluation/evaluate_llm.py can detect this
+# swallowed-failure fallback path instead of treating it as a normal generated answer.
 _GENERATION_FAILURE_MESSAGE = (
     "I'm sorry, the generation service is currently unavailable. Please try again later."
 )
-_GENERATION_FAILURE_MODEL = "generation-failed"
+GENERATION_FAILURE_MODEL = "generation-failed"
 
 
 @dataclass
@@ -104,7 +106,7 @@ def generate_answer(user_query: str, provider: str | None = None) -> GeneratedAn
 
         Never raises for LLM-side failures (unknown `provider`, missing
         credentials, rate limits, timeouts, outages, etc.) -- falls back
-        to `_GENERATION_FAILURE_MESSAGE`/`_GENERATION_FAILURE_MODEL` and
+        to `_GENERATION_FAILURE_MESSAGE`/`GENERATION_FAILURE_MODEL` and
         still persists the conversation, so the failure is visible in
         monitoring instead of crashing the request. Retrieval-layer
         failures (`retrieve()`) are intentionally NOT caught here and
@@ -134,7 +136,7 @@ def generate_answer(user_query: str, provider: str | None = None) -> GeneratedAn
             total_tokens=0,
             latency_seconds=0.0,
             cost_usd=0.0,
-            model=_GENERATION_FAILURE_MODEL,
+            model=GENERATION_FAILURE_MODEL,
         )
 
     # Full record of what was actually sent to the LLM (system + user turn), stored for monitoring.

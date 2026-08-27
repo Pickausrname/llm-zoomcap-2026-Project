@@ -93,13 +93,17 @@ def retrieve(user_query: str) -> RetrievalResult:
         results = lexical_search(rewritten_query, top_k=FINAL_N)
     elif approach == APPROACH_VECTOR:
         results = vector_search(rewritten_query, top_k=FINAL_N)
+    elif approach == APPROACH_HYBRID:
+        # Approach 3 (spec.md 9.2/11.2): "basic hybrid search" uses RRF
+        # fusion -- spec.md 9.2 explicitly notes RRF is "used by evaluation
+        # Approach 3" -- matching evaluate_retrieval.py's own Approach 3.
+        candidates = hybrid_search(rewritten_query, use_rrf=True)
+        logger.info("Stage 1 hybrid search (RRF) returned %d candidates", len(candidates))
+        results = candidates[:FINAL_N]
     else:
         candidates = hybrid_search(rewritten_query)
         logger.info("Stage 1 hybrid search returned %d candidates", len(candidates))
-        if approach == APPROACH_HYBRID:
-            results = candidates[:FINAL_N]
-        else:
-            results = rerank(rewritten_query, candidates)
+        results = rerank(rewritten_query, candidates)
 
     logger.info("Retrieval approach %r returned %d final documents", approach, len(results))
     return RetrievalResult(rewritten_query=rewritten_query, documents=results)

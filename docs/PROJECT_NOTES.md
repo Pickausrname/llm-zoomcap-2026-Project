@@ -1073,4 +1073,510 @@ zero diagnostics**.
   info about "uncommitted changes" from before this point as unverifiable.
 - Next planned module per the sequential build order noted above:
   `src/evaluation/evaluate_retrieval.py`.
+
+## src/evaluation/evaluate_retrieval.py (spec.md §11.2/§11.3)
+- Single public function `evaluate_retrieval() -> dict`, `__main__` entrypoint
+  (`logging.basicConfig` + call) for `make eval-retrieval`. No module-level
+  mutable state (all module "constants" are dicts/tuples, never mutated).
+- **4 approaches evaluated (14 result rows total):** Approach 1 `lexical_search`
+  only; Approach 2 `vector_search` only; Approach 3 `hybrid_search(use_rrf=True)`
+  (RRF, no rerank); Approach 4 `hybrid_search(alpha=a)` -> `reranker_stage.rerank`,
+  swept over `alpha in [0.0, 0.1, ..., 1.0]` (11 variants). Metrics (Hit Rate@5 /
+  MRR) computed over ALL ground-truth rows, cutoff reuses `config.FINAL_N` (5)
+  rather than a new hardcoded constant.
+- **Deliberate scope decision (documented in the module docstring):** does NOT
+  call `query_rewriter.rewrite_query()` — ground-truth questions (§11.1) are
+  already well-formed; Stage 0 is a production-pipeline concern orthogonal to
+  comparing the retrieval algorithms themselves.
+- **Approach 3 = RRF, not weighted fusion** (spec §11.2 allows either) — chosen
+  because spec.md §9.2 explicitly says RRF is "used by evaluation Approach 3",
+  and to keep Approach 3 meaningfully distinct from Approach 4's weighted-fusion
+  sweep.
+- **Real integration bug found & fixed while wiring this in (`src/retrieval/pipeline.py`):**
+  `retrieve()`'s `APPROACH_HYBRID` branch called `hybrid_search(rewritten_query)`
+  with NO `use_rrf=True` — i.e. production's "basic hybrid" (non-rerank) branch
+  was actually running **weighted** fusion, contradicting spec §9.2's explicit
+  RRF-for-Approach-3 intent and `evaluate_retrieval.py`'s own Approach 3. If
+  Approach 3 (RRF) had won an evaluation run and gotten written to
+  `ACTIVE_RETRIEVAL_APPROACH`, production would have silently served a
+  different (weighted) fusion than the one actually evaluated/selected. Fixed:
+  `APPROACH_HYBRID` branch now calls `hybrid_search(rewritten_query, use_rrf=True)`;
+  `APPROACH_HYBRID_RERANK` branch (Approach 4, weighted+rerank) was already
+  correct and untouched.
+- **Winner selection:** highest MRR across all 14 rows, tie-break on Hit Rate,
+  via `max(results, key=lambda r: (r["mrr"], r["hit_rate"]))` — Python's `max()`
+  keeps the *first* element reached on a tie, so ties resolve in the fixed
+  evaluation order (lexical -> vector -> RRF -> alpha sweep ascending).
+- **`config.py` rewrite (spec §11.3):** `_replace_config_source()` operates
+  line-by-line (`str.splitlines(keepends=True)` + per-line regex matching a
+  captured prefix/value/trailing-comment shape), preserving every other line
+  (including each target line's own trailing comment and the file's original
+  CRLF line endings, confirmed via a byte-count check) untouched. Read/write
+  both use `open(..., newline="")` specifically to avoid Python's universal-
+  newline translation silently converting config.py's CRLF endings to LF (or
+  double-corrupting them via the write-side translation) — this was verified
+  necessary, not just theoretical: `config.py` was confirmed (byte-count check)
+  to use CRLF throughout. Raises `RuntimeError` if any of the 3 target lines
+  can't be located, rather than silently writing a partial/wrong result.
+  Atomic write: `tempfile.mkstemp` in the same dir + `os.replace`, `os.remove`
+  cleanup on any exception — same pattern as `generate_ground_truth.py`'s CSV
+  write. Winner's `alpha`/`rrf_k` fall back to `config.ALPHA`/`config.RRF_K`
+  when the winning approach doesn't use that parameter (e.g. lexical/vector
+  winners still write *some* valid `ACTIVE_ALPHA`/`RRF_K`, just not swept ones).
+- **Empty/missing input handling (spec requirement, no crash):** missing or
+  all-malformed `ground_truth.csv` -> `logger.warning` + return
+  `{"results": [], "winner": None}` immediately, WITHOUT touching the JSON/CSV/
+  `config.py` outputs (overwriting previously-good evaluation artifacts with an
+  empty result was judged worse than leaving them as-is). Malformed individual
+  CSV rows (blank question, non-numeric `document_id`) are skipped with a
+  `logger.warning`, not a hard failure. An empty `master_table` needed NO
+  special-case code — `lexical_search`/`vector_search`/`hybrid_search` already
+  return `[]` gracefully for zero-match queries, which naturally yields
+  `hit_rate=mrr=0.0` rather than an exception. Infra-level failures (DB/schema
+  missing entirely) deliberately propagate uncaught, consistent with
+  `rag/generator.py`'s documented judgment call on retrieval-layer outages.
+- No new `requirements.txt` entries — only stdlib (`csv`, `json`, `os`, `re`,
+  `tempfile`, `pathlib`, `collections.abc.Callable`) plus existing internal
+  `src.*` imports.
+- **Self-review caught one bug before smoke testing was even needed to reveal
+  it** (the `pipeline.py` RRF-branch bug above), found by cross-checking spec
+  §9.2's literal wording against `pipeline.py`'s actual branching logic rather
+  than assuming the already-built module was correct.
+- **Runtime smoke test (throwaway venv: `python-dotenv sqlite-vec numpy
+  onnxruntime transformers` — no `openai`/`google-genai`/`pydantic`/`tenacity`
+  needed since this module never imports `src.llm`) found and fixed ONE MORE
+  real bug that static analysis (`get_errors` + `pylanceFileSyntaxErrors`, both
+  clean) completely missed:** `_replace_config_source()`'s inner loop wrote
+  `for key, pattern in list(remaining.items())` — but `remaining` is
+  `dict[str, str]` (key -> *replacement value*), not `dict[str, re.Pattern]`,
+  so `pattern.match(body)` raised `AttributeError: 'str' object has no
+  attribute 'match'` on the very first call. Fixed to look up the actual regex
+  via `_ASSIGNMENT_PATTERNS[key]` and pop the replacement value separately.
+  **Lesson reinforced (already in `/memories/debugging.md` but worth
+  re-noting): Pylance's `get_errors` did NOT flag this even though `remaining`
+  had an inferrable concrete type (`dict[str, str]`) and `.match` is not a str
+  attribute — static analysis alone is not sufficient for this kind of bug;
+  runtime smoke testing (even a synthetic/mocked one) is what actually caught
+  it.** Test coverage after the fix (all passed): (a) metric math on synthetic
+  known-rank data (hit@1, hit@3 partial rank 1/3, and a miss, verified exact
+  hit_rate/MRR); (b) `config.py` rewrite happy path against a real copy of the
+  actual file — confirmed exactly 3 lines differ (byte-for-byte compare of
+  every other line, split on `\r\n`) and each new line's content/trailing
+  comment is correct; (c) simulated `os.replace` failure (monkeypatched to
+  raise) — confirmed the target file is byte-identical to before the call and
+  zero leftover `.config_*` temp files remain; (d) full `evaluate_retrieval()`
+  orchestration against monkeypatched `lexical_search`/`vector_search`/
+  `hybrid_search`/`rerank` with a deterministic 3-question ground truth (one
+  clean hit-rank-1, one partial hit-rank-2 lexically but rank-1 vector, one
+  lexical-miss/vector-hit) — verified per-approach Hit Rate/MRR match hand-
+  computed expected values for all 14 rows (including both ends of the alpha
+  sweep), the JSON/CSV outputs contain all 14 rows with exactly one
+  `is_winner=True`, the winner is written correctly into a fake `config.py`
+  copy, and **the real `src/config.py` was confirmed byte-identical
+  before/after the whole test run** (never touched, since the module always
+  resolves its rewrite target via the mockable `_config_module.__file__`, not
+  a hardcoded path); (e) missing `ground_truth.csv` -> confirmed
+  `{"results": [], "winner": None}` returned and no JSON/CSV output files
+  created. Temp venv + all temp files/dirs deleted afterward (verified via
+  `Test-Path`, per the temp-file-DB cleanup hygiene lesson).
+- `pylanceFileSyntaxErrors` + `get_errors` clean on both touched files
+  (`evaluate_retrieval.py`, `retrieval/pipeline.py`) after the fixes. `git
+  status`/`git diff --stat` confirmed only those two files changed —
+  `src/config.py` untouched in the working tree (it's only rewritten at actual
+  eval-run time, not during development).
+
+## Cross-module static integration review #6 (after src/evaluation/evaluate_retrieval.py)
+Re-read all 29 `src/` files in full (8 empty `__init__.py` + 21 substantive
+modules) and ran `pylanceFileSyntaxErrors` individually on all 21 substantive
+files, plus `get_errors` on the whole `src/` tree — **all clean, zero syntax
+errors, zero diagnostics.**
+- **No new bugs found this round** — `evaluate_retrieval.py`'s own build
+  session (self-review + runtime smoke test + a follow-up user-requested
+  review) already caught and fixed the only two real issues introduced by
+  that work (the `pipeline.py` RRF-branch bug and the `_replace_config_source`
+  pattern/value mix-up — see the entries above).
+- **Cross-module wiring, re-verified end-to-end from scratch:** every
+  constant every module imports from `config.py` exists with the expected
+  type (traced all `from src.config import ...`/`import src.config as ...`
+  usages across all 21 files); `LLMClient.structured()`'s
+  `(parsed_model, LLMResponse)` return contract is implemented identically by
+  `openai_client.py`/`gemini_client.py` and consumed identically by both
+  callers (`rag/judge.py`, `evaluation/generate_ground_truth.py`);
+  `insert_conversation()`/`insert_feedback()` parameter names match their
+  call sites in `rag/generator.py`/`rag/judge.py` exactly (incl. the
+  intentional `cost_usd`/`latency_seconds` -> `cost`/`response_time` mapping);
+  `master_table`/`master_fts`/`master_vec` column names stay consistent
+  across `knowledge_store.py` (schema), `ingestion/pipeline.py` (INSERT),
+  `ingestion/resources.py` (`MasterTableRecord`), `retrieval/hybrid_search.py`
+  (`Document`/SELECT), and `evaluation/generate_ground_truth.py`
+  (`_fetch_records` SELECT); `embed()`/`score()` call shapes (incl. the
+  `(query_vector,) = embed([query_text])` single-row unpack pattern) match
+  every caller in `ingestion/` and `retrieval/`; `lexical_search`/
+  `vector_search`/`hybrid_search`/`rerank`'s signatures match every call site
+  in `retrieval/pipeline.py` and `evaluation/evaluate_retrieval.py` exactly,
+  including the now-fixed `APPROACH_HYBRID` branch's `use_rrf=True` call
+  matching `evaluate_retrieval.py`'s own Approach 3. **No import cycle:**
+  dependency direction is still strictly `config -> {db, llm, models_onnx} ->
+  {ingestion, retrieval} -> {rag, evaluation}` — verified by listing every
+  module's internal imports from scratch, not reusing any prior review's map.
+- **`requirements.txt` audit:** every third-party import across all 21
+  substantive files (`dotenv`, `sqlite_vec`, `dlt`, `fitz`, `optimum.onnxruntime`,
+  `transformers`, `onnxruntime`, `numpy`, `openai`, `google.genai`, `pydantic`,
+  `tenacity`) is pinned; nothing pinned-but-unused. `evaluate_retrieval.py`
+  needed no new entries (stdlib `csv`/`json`/`os`/`re`/`tempfile`/`pathlib`/
+  `collections.abc.Callable` + existing internal `src.*` imports).
+- **`__init__.py` audit:** all 8 (`src/`, `db/`, `evaluation/`, `ingestion/`,
+  `llm/`, `models_onnx/`, `rag/`, `retrieval/`) confirmed empty (0 bytes).
+- **Dead-code grep** (`print(`/`TODO`/`FIXME`/`pdb`/`breakpoint`): still only
+  the one already-judged-intentional `print(load_info)` in
+  `ingestion/pipeline.py`'s `run()` — no new leftovers anywhere, including the
+  new `evaluation/evaluate_retrieval.py`.
+
+## src/evaluation/evaluate_llm.py (spec §11.4) — pre-build design decisions (resolved before any code written)
+Resolved in a planning conversation (2026-08-27), before the module exists —
+apply these when actually building it, don't re-litigate:
+1. **Judge cross-grading (avoids self-preference bias):** the judge LLM for
+   grading `(Q, A, A')` must be the OPPOSITE provider from whichever model
+   generated that A' — openai's answers are judged by gemini, gemini's
+   answers are judged by openai. Never same-provider self-grading.
+2. **Judge verdicts (`JudgeVerdict`, spec §11.4's own `good`/`bad` + `reasoning`
+   schema — NOT `rag/judge.py`'s `RelevanceVerdict`) DO get persisted**, via
+   two sanctioned additions to `src/db/monitoring_store.py` (deliberate schema
+   extension, not a bug fix — `evaluate_llm.py`'s build session should treat
+   this as in-scope, not "don't touch other modules"):
+   a. Per-row verdicts -> existing `feedback` table, tied to the real
+      `conversation_id` from that row's `generate_answer()` call, but tagged
+      with a NEW, distinct `source` value `"eval_judge"` (not `"judge"`) so
+      offline benchmark runs never blend with the live production relevance
+      judge's `feedback` rows in a "judge score over time" dashboard query.
+      Requires widening `CHECK (source IN ('user','judge'))` ->
+      `CHECK (source IN ('user','judge','eval_judge'))` and
+      `_VALID_FEEDBACK_SOURCES` accordingly.
+   b. A NEW `llm_eval_runs` table (one row per `(model, run_timestamp)` per
+      `make eval-llm` invocation: accuracy, total cost, avg latency,
+      n_samples, is_winner) -- INSERTED every run, never overwritten. This is
+      the actual backing store for a "trend over time" dashboard chart, since
+      `evaluate_retrieval.py`-style JSON/CSV outputs are atomically
+      OVERWRITTEN each run (correct for "current active config", useless for
+      history). Needs a writer function (e.g. `insert_llm_eval_run(...)`,
+      same self-contained-connection pattern as `insert_conversation`/
+      `insert_feedback`) and an `init_db()` DDL addition.
+   - **No migration concern right now:** confirmed via the workspace hygiene
+     check (2026-08-27) that `data/monitoring.db` doesn't exist on disk yet
+     (nothing has actually run `init_db()` for real against a persistent file
+     yet), so this is a clean additive schema change, not a live migration.
+3. **Forward note for the future `src/app/dashboard.py` build (spec §13.4,
+   not yet built):** confirmed (2026-08-27) the `source="eval_judge"` split
+   does NOT conflict with §13.4 item 4 ("Judge Relevance Distribution"
+   bar chart of RELEVANT/PARTLY_RELEVANT/NON_RELEVANT counts) — that item's
+   query MUST filter `source='judge'` (or equivalently `label IN
+   ('RELEVANT','PARTLY_RELEVANT','NON_RELEVANT')`) so `eval_judge` rows never
+   leak into it; the split is what protects that guarantee, not a source of
+   conflict. HOWEVER: §13.4 also says "Do not add extra charts. The
+   dashboard MUST contain exactly these five" — so the "judge/eval score
+   trend over time" view (backed by `llm_eval_runs`) the user wants
+   MUST NOT be added as a 6th chart inside `dashboard.py`. It needs its own
+   separate surface (a distinct page/section, ad-hoc report, or notebook
+   query against `llm_eval_runs`) — decide this explicitly when `dashboard.py`
+   is actually built, don't silently bolt it onto the fixed 5-chart dashboard.
+4. **Concurrency granularity:** sequential-per-model, parallel-within-model —
+   run ALL ground-truth questions through one model (openai) via a single
+   ThreadPoolExecutor batch, wait for it to fully finish, THEN run the same
+   set through the other model (gemini) via a second batch. Never interleave
+   both models' requests in one shared pool (gentler on each provider's rate
+   limits, simpler to reason about/debug than one giant mixed to-do list).
+5. **Failure handling:** skip-and-continue, matching every other module's
+   established convention (`pdf_extractor.py`/`generate_ground_truth.py`/
+   `evaluate_retrieval.py`) — one row's `generate_answer()`/judge-call failure
+   is logged and excluded from that model's accuracy/cost/latency averages,
+   never aborts the whole run. Track a per-model failure count explicitly —
+   it doubles as the "reliability" input spec §11.4 requires for winner
+   selection (a model failing more often is less reliable at comparable
+   accuracy).
+6. **No `config.py` write-back for the LLM-eval winner** (unlike
+   `evaluate_retrieval.py`/spec §11.3, which explicitly mandates rewriting
+   `ACTIVE_RETRIEVAL_APPROACH`/`ACTIVE_ALPHA`/`RRF_K`). Spec §11.4 only says
+   the code should "select and output" the winning model — it never repeats
+   the "write it back to config.py" instruction the way §11.3 does. Also,
+   `DEFAULT_LLM_PROVIDER` is a much bigger-blast-radius setting than the
+   retrieval-approach constants (it's the vendor every feature in the app
+   depends on — cost, rate limits, reliability — not just an internal
+   algorithm choice), and the winner here is chosen from a synthetic
+   ground-truth benchmark, not real production traffic. `evaluate_llm()`
+   reports the winner (JSON/CSV + logs) only; a human decides whether to
+   then manually update `DEFAULT_LLM_PROVIDER`. `evaluate_llm.py` must NOT
+   touch `src/config.py` at all.
+
+## src/evaluation/evaluate_llm.py (spec §11.4) — built, per the pre-build design decisions above
+Implemented exactly per the "pre-build design decisions" entry above (all 6
+numbered items applied as-is, none re-litigated) plus SPEC.MD §11.4 itself.
+- Single public function `evaluate_llm() -> dict`, `__main__` entrypoint for
+  `make eval-llm`. No module-level mutable state.
+- `JudgeVerdict(BaseModel)` (`verdict: Literal["good","bad"]`, `reasoning: str`)
+  defined fresh in this module per spec §11.4's own schema — NOT
+  `rag/judge.py`'s `RelevanceVerdict` (documented in the module docstring:
+  that judge grades relevance-to-query, has no `A`/source-answer input).
+- **A resolution:** `_resolve_answers()` does ONE batch
+  `SELECT id, search_text FROM master_table` (mirrors
+  `generate_ground_truth.py`'s `_fetch_records` join pattern) instead of one
+  query per ground-truth row; rows whose `document_id` has no match, or whose
+  `search_text` is empty, are skipped with `logger.warning`.
+- **Cross-grading:** `_JUDGE_PROVIDER = {"openai": "gemini", "gemini": "openai"}`
+  — the judge LLM for a row is always the opposite provider from the model
+  that generated `A'`. Verified by smoke test (see below).
+- **Concurrency:** `evaluate_llm()`'s `for model in _MODELS:` loop opens a
+  *new* `ThreadPoolExecutor` per model and fully drains it
+  (`list(executor.map(...))`) before the loop moves to the next model —
+  sequential-per-model, parallel-within-model, never interleaved.
+- **Failure handling:** `_evaluate_row()` never raises — a `generate_answer()`
+  exception sets `failure_stage="generation"`; a judge `.structured()`
+  exception sets `failure_stage="judge"`; both are logged
+  (`exc_info=True`) and excluded from that model's `accuracy`/
+  `avg_latency_seconds`, but counted in `n_failures`. A THIRD failure point
+  (`insert_feedback()` persistence, after a successful judge call) is also
+  caught+logged but deliberately does NOT count as a row failure or drop the
+  verdict from in-memory aggregation — the verdict was already validly
+  produced; only its DB write failed.
+- **Qualitative failure analysis (own documented heuristic, not spec-
+  mandated):** for every row judged `"bad"`, `_categorize_failure()` makes
+  ONE extra `src.retrieval.pipeline.retrieve()` call (only for bad rows,
+  since `GeneratedAnswer` doesn't expose the documents `generate_answer()`
+  retrieved internally) and classifies zero-documents-retrieved as
+  `"missing_context"`, documents-retrieved-but-not-the-ground-truth-id as
+  `"irrelevant_context"` (uses the ground-truth `document_id` itself as the
+  correctness check, not a score threshold — cross-encoder rerank scores are
+  raw unbounded logits, not 0-1 normalized, so a threshold would be
+  meaningless), and ground-truth-id-was-retrieved as `"hallucination"`.
+- **Winner selection (`_select_winner`):** explicit deterministic rule —
+  highest `accuracy` first, ties broken by fewer `n_failures` (reliability),
+  then by lower `total_cost_usd` (cost efficiency) — satisfies spec §11.4's
+  "accuracy, cost efficiency, and reliability" wording without inventing an
+  opaque weighted score.
+- **Outputs:** `LLM_EVAL_RESULTS_JSON` holds `{"rows": [...all per-row
+  dicts...], "aggregates": {model: {...}}, "winner", "winner_reason"}`;
+  `LLM_EVAL_RESULTS_CSV` holds only the flat per-row table (same rows list) —
+  per-model aggregates/winner are JSON-only since they don't fit a flat
+  per-row table. Both written via the same tempfile+`os.replace` atomic
+  pattern as `evaluate_retrieval.py`.
+- **`src/config.py`:** added `LLM_EVAL_RESULTS_JSON`/`LLM_EVAL_RESULTS_CSV`
+  (same `DATA_DIR / "llm_eval_results.{json,csv}"` convention as the
+  retrieval-eval constants). No other config.py changes — confirmed via a
+  before/after byte-identical check in the smoke test (decision 6: no
+  write-back).
+- **`src/db/monitoring_store.py` extensions (sanctioned, per decision 2):**
+  (a) `_VALID_FEEDBACK_SOURCES` widened to
+  `frozenset({"user", "judge", "eval_judge"})` and the `feedback.source`
+  CHECK constraint widened to match; `insert_feedback()`'s docstring updated
+  to document `"eval_judge"`'s label vocabulary (`"good"`/`"bad"`) alongside
+  `"judge"`'s (`RELEVANT`/`PARTLY_RELEVANT`/`NON_RELEVANT`). (b) new
+  `llm_eval_runs` table (`id, model, run_timestamp, accuracy, total_cost,
+  avg_latency, n_samples, n_failures, is_winner CHECK(0,1)`) + `init_db()`
+  wiring + `insert_llm_eval_run(...)` writer (same self-contained-connection
+  pattern as `insert_conversation`/`insert_feedback`, added to `__all__`).
+  One row per `(model, run_timestamp)` per `evaluate_llm()` call (same
+  `run_timestamp` for both models in one run), always INSERTED.
+- No new `requirements.txt` entries — only stdlib (`csv`, `json`, `os`,
+  `tempfile`, `concurrent.futures.ThreadPoolExecutor`, `dataclasses`,
+  `datetime`, `typing.Literal`) plus already-pinned `pydantic` and existing
+  internal `src.*` imports.
+- **Runtime smoke-tested** in a throwaway venv (full non-ingestion deps:
+  `python-dotenv sqlite-vec optimum[onnxruntime] transformers onnxruntime
+  numpy openai google-genai pydantic tenacity` — needed because
+  `evaluate_llm.py` transitively imports `rag.generator` ->
+  `retrieval.pipeline` -> `models_onnx.embedder`/`llm.factory`). Seeded a
+  real temp knowledge DB (3 `master_table` rows) + temp monitoring DB +
+  temp `ground_truth.csv` (3 usable rows + 1 row pointing at a non-existent
+  `document_id=99`, to test the skip-and-warn path). Monkeypatched
+  `evaluate_llm.generate_answer`/`get_llm`/`retrieve` (module-level
+  rebinding, since all three are imported via `from ... import`) to
+  simulate: one generation-stage failure (openai/CE300), one judge-stage
+  failure (gemini-judging-openai/BE200), one "bad" verdict with zero
+  retrieved docs (openai/AC100, judged bad by gemini) and all-"good" gemini
+  answers (judged by openai). Verified: `document_id=99` row correctly
+  skipped with a warning; per-model `n_samples`/`n_judged`/`n_failures`/
+  `accuracy`/`avg_latency_seconds`/`total_cost_usd`/`failure_analysis`
+  (`{"missing_context": 1}` for openai) all matched hand-computed values
+  exactly; cross-grading confirmed via `judge_provider` on every emitted row
+  (openai rows always judged by "gemini" and vice versa); sequential-per-
+  model execution order implicitly verified (each model's full batch
+  completes — `n_samples` counts are correct per model — before the next
+  starts); winner correctly picked gemini (strictly higher accuracy);
+  JSON/CSV outputs well-formed and match in-memory results; `feedback`
+  table got exactly 4 `source="eval_judge"` rows (one per row that was
+  BOTH successfully generated AND successfully judged) with correct
+  `good`/`bad` labels; `llm_eval_runs` got exactly 2 rows (one per model)
+  with correct `is_winner`/`n_samples`/`n_failures`; a raw bypass INSERT
+  with `source='bogus'` still raises a `CHECK`-constraint `IntegrityError`
+  (confirms the widened CHECK constraint, not just the Python-level guard);
+  empty-ground-truth-CSV and missing-ground-truth-CSV both returned
+  `{"rows": [], "aggregates": {}, "winner": None, "winner_reason": None}`
+  without touching any output; **`src/config.py` confirmed byte-identical
+  before vs. after the full run** (decision 6 verified, not just assumed).
+  All assertions passed. Temp venv + temp DB/CSV/JSON/CSV-output dirs
+  deleted afterward (per the temp-file-DB cleanup hygiene lesson).
+- `pylanceFileSyntaxErrors` + `get_errors` both clean on `evaluate_llm.py`,
+  `monitoring_store.py`, and `config.py` after all edits.
+- **No bugs found needing a review-round fix** — this build followed the
+  already-resolved design-decision entry closely enough that the smoke test
+  (which specifically exercised cross-grading, sequential/parallel
+  concurrency, skip-and-continue at both failure points, the failure-
+  analysis heuristic, and both new DB schema pieces end-to-end) passed on
+  the first attempt with no code changes needed afterward.
+
+## src/evaluation/evaluate_llm.py — follow-up review round (found and fixed a real gap)
+User asked for one more review pass after the initial build above.
+- **Real bug found:** `rag/generator.py`'s `generate_answer()` swallows most
+  LLM-side failures internally (unknown provider, missing credentials, rate
+  limits, timeouts, outages) and returns a canned fallback `GeneratedAnswer`
+  (`model="generation-failed"`, the private `_GENERATION_FAILURE_MODEL`
+  sentinel) instead of raising — see its own earlier Gemini-review-round
+  entry above. `evaluate_llm.py`'s `_evaluate_row()` only detected
+  generation failures via a *raised exception*, so a real LLM outage during
+  an eval run would have silently been treated as a normal successful
+  generation: the canned "service unavailable" text would be sent to the
+  cross-graded judge, almost certainly scored `"bad"`, and counted toward
+  accuracy/`failure_analysis` (likely misclassified as `"hallucination"`
+  since retrieval would have returned real context) — WITHOUT incrementing
+  `n_failures`, silently corrupting the "reliability" signal winner-selection
+  depends on, and wasting a real judge-LLM call grading a non-answer.
+- **Fix:** made `rag/generator.py`'s sentinel public — renamed
+  `_GENERATION_FAILURE_MODEL` -> `GENERATION_FAILURE_MODEL`, added to its
+  `__all__` (only a name change, no behavior change; `_GENERATION_FAILURE_MESSAGE`
+  stays private since nothing outside the module needs the exact wording).
+  `evaluate_llm.py` now imports it and checks `generated.model ==
+  GENERATION_FAILURE_MODEL` immediately after a successful `generate_answer()`
+  call: if true, logs a `logger.warning`, sets `failure_stage="generation"`
+  (same field a raised exception would set) with a distinct
+  `failure_reason`, and returns immediately WITHOUT calling the judge —
+  saving a wasted judge-LLM call and keeping `generation_succeeded=False` so
+  the row is correctly excluded from `avg_latency_seconds` too (the fallback
+  path's `latency_seconds=0.0` would otherwise have dragged the average
+  toward zero). Chose importing the real constant over duplicating the
+  `"generation-failed"` string literal, to avoid drift risk if the sentinel
+  value ever changes in `generator.py`.
+- **Verified via a second focused smoke test** (throwaway venv, both models):
+  monkeypatched `generate_answer` to always return the
+  `GENERATION_FAILURE_MODEL` fallback, and `get_llm` to `raise
+  AssertionError` if ever called — confirmed the judge is never invoked,
+  both models' `n_failures=1`/`n_judged=0`/`accuracy=0.0`/
+  `avg_latency_seconds=0.0`/`total_cost_usd=0.0`, every emitted row has
+  `failure_stage="generation"` with the new fallback-specific reason text,
+  and zero `feedback` rows were persisted. `pylanceFileSyntaxErrors` +
+  `get_errors` clean on both `evaluate_llm.py` and `generator.py` after the
+  edit; grepped for the old private name across `src/` — zero remaining
+  references, rename fully applied.
+- Rest of the file re-read line-by-line this round: no other issues found
+  (aggregation math, winner selection, CSV/JSON writers, cross-grading
+  wiring, and the `llm_eval_runs`/`feedback` persistence calls all still
+  correct after the fix).
+
+## Cross-module static integration review #7 (full re-read, after src/evaluation/evaluate_llm.py + its two review rounds)
+Re-read all 30 `src/` files in full from scratch (8 empty `__init__.py` + 22
+substantive modules) and ran `pylanceFileSyntaxErrors` individually on all 22
+substantive files, plus `get_errors` on the whole `src/` tree — **all clean,
+zero syntax errors, zero diagnostics.**
+- **No new code bugs found this round** — the two prior `evaluate_llm.py`
+  review rounds (initial build smoke test + the `GENERATION_FAILURE_MODEL`
+  sentinel-detection fix) already caught the only real issues from that work.
+- **One housekeeping finding, fixed:** `src/retrieval/SPEC.MD` was a
+  byte-identical duplicate of the root `SPEC.MD` (confirmed via
+  `Get-FileHash` on both + `git log --follow`, which showed it was
+  accidentally committed inside the `retrieval` package in the very first
+  commit). Not a functional bug (a `.md` file, never imported), but stray
+  clutter inside a Python package — deleted it (`git status` confirms only
+  a clean `D src/retrieval/SPEC.MD`, nothing else touched).
+- **Cross-module wiring, re-verified end-to-end from scratch (not spot-
+  checked, not reused from any prior review's map):** every constant every
+  module imports from `config.py` exists with the expected type/annotation
+  (`BASE_DIR`/`DATA_DIR`/`RAW_DIR`/`MODELS_DIR`/`EMBEDDING_MODEL_DIR`/
+  `RERANKER_MODEL_DIR`/`KNOWLEDGE_DB`/`MONITORING_DB`/`GROUND_TRUTH_CSV`/
+  `RETRIEVAL_EVAL_RESULTS_JSON`/`CSV`/`LLM_EVAL_RESULTS_JSON`/`CSV`/
+  `EMBEDDING_MODEL_ID`/`RERANKER_MODEL_ID`/`EMBEDDING_DIM`/`OPENAI_MODEL`/
+  `GEMINI_MODEL`/`DEFAULT_LLM_PROVIDER`/`TOP_K`/`FINAL_N`/`RRF_K`/
+  `APPROACH_*`/`ALPHA`/`ACTIVE_ALPHA`/`ACTIVE_RETRIEVAL_APPROACH`/
+  `PRICING_PER_1K_TOKENS`); `LLMClient.structured()`'s
+  `(parsed_model, LLMResponse)` return contract is implemented identically
+  by `openai_client.py`/`gemini_client.py` and consumed identically by all
+  three callers (`rag/judge.py`, `evaluation/generate_ground_truth.py`,
+  `evaluation/evaluate_llm.py`); `LLMResponse` field names
+  (`text`/`prompt_tokens`/`completion_tokens`/`total_tokens`/
+  `latency_seconds`/`cost_usd`/`model`) used identically everywhere;
+  `insert_conversation()`/`insert_feedback()`/`insert_llm_eval_run()`
+  parameter names match their call sites exactly in `rag/generator.py`,
+  `rag/judge.py`, `evaluation/evaluate_llm.py` (incl. the intentional
+  `cost_usd`/`latency_seconds` -> `cost`/`response_time` mapping at the
+  `insert_conversation()` call site); `master_table`/`master_fts`/
+  `master_vec` column names/order stay consistent across
+  `knowledge_store.py` (schema), `ingestion/pipeline.py` (INSERT),
+  `ingestion/resources.py` (`MasterTableRecord`), `retrieval/
+  hybrid_search.py` (`Document`/SELECT), `evaluation/
+  generate_ground_truth.py` (`_fetch_records`), and `evaluation/
+  evaluate_llm.py` (`_resolve_answers`); `ground_truth.csv`'s
+  `question,document_id` header/column order is produced identically by
+  `generate_ground_truth.py` and consumed identically (incl. the
+  `int(raw_id)` parse) by both `evaluate_retrieval.py`'s and
+  `evaluate_llm.py`'s own `_load_ground_truth()` (two independent, not
+  shared, implementations -- both correct, no drift); `embed()`/`score()`
+  call shapes match every caller in `ingestion/` and `retrieval/`;
+  `RetrievalResult.rewritten_query`/`.documents` match exactly what both
+  `rag/generator.py` and `evaluation/evaluate_llm.py`'s
+  `_categorize_failure()` read; `GeneratedAnswer`'s 9 fields (incl.
+  `GENERATION_FAILURE_MODEL` sentinel now public) match exactly what
+  `evaluate_llm.py` reads. **No import cycle:** dependency direction is
+  still strictly `config -> {db, llm, models_onnx} -> {ingestion,
+  retrieval} -> {rag, evaluation}` (evaluation also depends on rag), traced
+  from every file's own top-level imports, not reused from any prior
+  review's map.
+- **`requirements.txt` audit (re-verified from scratch via a full grep of
+  every `^import `/`^from \w` line across all 22 files):** all 12 pinned
+  packages actually used (`python-dotenv`, `sqlite-vec`, `dlt`, `pymupdf`,
+  `optimum[onnxruntime]`, `transformers`, `onnxruntime`, `numpy`, `openai`,
+  `google-genai`, `pydantic`, `tenacity`); nothing pinned-but-unused,
+  nothing used-but-unpinned.
+- **`__init__.py` audit:** all 8 (`src/`, `db/`, `evaluation/`, `ingestion/`,
+  `llm/`, `models_onnx/`, `rag/`, `retrieval/`) confirmed empty (0 bytes),
+  re-verified by direct read, not assumed.
+- **Dead-code grep** (`print(`/`TODO`/`FIXME`/`pdb`/`breakpoint`): still
+  only the one already-judged-intentional `print(load_info)` in
+  `ingestion/pipeline.py`'s `run()` (CLI stdout feedback for `make
+  ingest`, alongside its own `logger.info`) -- no new leftovers anywhere.
+
+## Workspace hygiene & security check (after src/evaluation/evaluate_llm.py + its review rounds)
+User-requested pass, separate from the code review rounds above.
+- **Real gap found & fixed:** `.gitignore` was never updated when
+  `LLM_EVAL_RESULTS_JSON`/`LLM_EVAL_RESULTS_CSV` were added to `config.py` --
+  it only listed `data/retrieval_eval_results.json`/`.csv` (the §11.3 eval's
+  outputs), not the new `data/llm_eval_results.json`/`.csv` (§11.4's outputs).
+  `data/*.db` already generically covers `monitoring.db`/`knowledge.db`, so
+  that part was fine -- only the two new explicit CSV/JSON filenames were
+  missing. Fixed by adding both lines next to the existing
+  `retrieval_eval_results` entries. Lesson: adding a new generated-artifact
+  path to `config.py` must come with a matching `.gitignore` entry in the
+  same change -- add this to the standing checklist for any future
+  `evaluate_*`/`generate_*` module that writes a new output file.
+- **No temp-file/leftover-venv issues found:** `%TEMP%` swept for
+  `*evalllm*`/`venv_*`/`*smoke*`/`*eval_retrieval*` -- zero hits, both
+  smoke-test venvs and their marker files were fully cleaned up already (per
+  the temp-file-DB cleanup hygiene lesson). `src/`/project root swept
+  (`-Recurse`) for `_tmp_*`/`*.tmp`/`tmp*`/`*.pyc` -- zero hits. `data/`
+  directory contains only `raw/` (no stray `.db`/`.csv` from a smoke test
+  accidentally writing to the real `config.DATA_DIR` instead of a temp path).
+  `__pycache__/` dirs exist under `src/` (normal Python bytecode cache from
+  running the smoke tests) but are already `.gitignore`d and git-confirmed
+  untracked (`git status --ignored`) -- not a hygiene issue, left as-is.
+- **No hardcoded secrets/test keys found:** grepped all of `src/` for
+  `sk-`/`api_key=`/`AIza`/`password=`/`secret=` patterns -- only false-positive
+  matches on an unrelated code comment ("tests, etc."). No `.env` file exists
+  on disk at all (`Test-Path` false); confirmed never tracked by git
+  (`git ls-files` empty for `.env`) and correctly covered by `.gitignore`.
+- **No unwanted dependencies:** `git diff requirements.txt` is empty --
+  confirmed byte-for-byte unchanged this entire session (matches the
+  established fact that `evaluate_llm.py` needed zero new pins).
+- **No debug leftovers in the diff:** re-grepped for
+  `print(`/`TODO`/`FIXME`/`pdb`/`breakpoint`/`localhost`/`127.0.0.1` across
+  all of `src/` -- only the one already-judged-intentional
+  `print(load_info)` in `ingestion/pipeline.py`. `git diff --stat` on the
+  three modified existing files (`config.py` +2, `monitoring_store.py`
+  +111/-2, `generator.py` +10/-8 lines) matches the expected scope of this
+  session's changes with nothing extraneous.
 </content>
