@@ -1579,4 +1579,261 @@ User-requested pass, separate from the code review rounds above.
   three modified existing files (`config.py` +2, `monitoring_store.py`
   +111/-2, `generator.py` +10/-8 lines) matches the expected scope of this
   session's changes with nothing extraneous.
+
+## src/app/ (new package, spec.md section 13 -- Streamlit UI)
+- `__init__.py` (empty), `qa_panel.py`, `dashboard.py`, `streamlit_app.py`.
+  This is the final layer of the app -- consumes `rag/generator.py`,
+  `rag/judge.py`, and `db/monitoring_store.py` exactly as those modules'
+  own docstrings anticipated (`judge.py`'s live production judge had zero
+  callers before this session; `monitoring_store.py`'s docstring already
+  pointed dashboard queries here).
+- **`config.py` addition:** `JUDGE_SAMPLE_RATE: float = 1.0` -- fraction of
+  conversations the live judge (spec.md section 10.2) auto-grades from real
+  traffic. Default `1.0` (judge every conversation, fully spec-compliant
+  out of the box); a deployer can lower it for cost control with a one-line
+  edit. Not exposed in the UI.
+- **`qa_panel.py`:** single public `render_qa_panel() -> None`. Decision
+  (not spec-mandated, resolved before writing code): render the answer +
+  execution metrics via `st.write` FIRST, then -- gated by
+  `_should_judge()`/`JUDGE_SAMPLE_RATE` -- call `judge_answer()`
+  synchronously in the same request. This is the only way
+  `feedback.source="judge"` rows (and therefore the dashboard's "Judge
+  Relevance Distribution" chart) get populated from real traffic, since
+  `judge.py` had no other caller. Judge failures are caught/logged and
+  never affect the already-rendered answer.
+  - Non-widget logic deliberately factored into three small, directly
+    unit-testable functions (no `st.*` calls): `_should_judge(sample_rate)`
+    (pure sampling gate), `_maybe_judge(user_query, answer,
+    conversation_id)` (gate + try/except `judge_answer()` call), and
+    `_handle_feedback(conversation_id, score)` (calls
+    `insert_feedback(source="user", ...)`). `_submit_query()`/
+    `_render_stored_result()` are the only functions touching `st.*`,
+    calling into those three.
+  - `st.session_state["qa_last_result"]` stores `conversation_id`, the
+    rendered answer, and every execution metric (`prompt_tokens`/
+    `completion_tokens`/`total_tokens`/`latency_seconds`/`cost_usd`) at
+    submit time only -- a feedback-button click (which triggers a
+    Streamlit rerun) re-renders from session state without re-calling
+    `generate_answer()`/`judge_answer()` (would silently duplicate real
+    LLM cost). Streamlit's own rerun-on-widget-interaction model means no
+    manual `st.rerun()` call is needed after `insert_feedback()`.
+  - Retrieval-layer exceptions from `generate_answer()` (its own
+    documented infrastructure-failure case, deliberately NOT swallowed
+    inside `generator.py` itself) are caught here at the UI boundary and
+    shown via `st.error(...)`, so a DB/ONNX outage never crashes the whole
+    Streamlit process. LLM-side failures never reach here at all --
+    `generate_answer()` already swallows those internally
+    (`GENERATION_FAILURE_MODEL` sentinel).
+  - No provider selector in the UI (both `generate_answer()`/
+    `judge_answer()` called with `provider=None`, falling back to
+    `config.DEFAULT_LLM_PROVIDER`) -- spec section 13 never mentions one.
+- **`dashboard.py`:** single public `render_dashboard() -> None`
+  implementing EXACTLY the 5 spec-mandated items (Summary KPIs via
+  `st.columns`+`st.metric`; Cost Over Time / Response Time Over Time via
+  `st.line_chart`; Judge Relevance Distribution / User Feedback Comparison
+  via `st.bar_chart`) -- no extra charts. `monitoring_store.py` exposes no
+  read/aggregation queries by design (per its own docstring), so this
+  module owns all the SQL.
+  - SQL/aggregation factored into 5 small helper functions (`_fetch_*`),
+    each taking a `sqlite3.Connection` and returning a plain dict or
+    `pd.DataFrame` -- separate from the `st.*` rendering calls in
+    `render_dashboard()`, specifically so they're directly unit-testable
+    against a seeded DB without a running Streamlit app.
+  - **Judge Relevance Distribution query filters `source='judge'` only**
+    (never blends in `evaluate_llm.py`'s offline `source='eval_judge'`
+    benchmark rows) -- exactly the split `monitoring_store.py`'s schema
+    was built to protect (see its own comment/docstring).
+  - Uncached by design (no `st.cache_data`) -- local, low-volume SQLite
+    store; always showing the latest conversation/feedback on every rerun
+    matters more than avoiding a repeated `SELECT`.
+  - Empty-store handling: every `_fetch_*` helper returns sensible
+    zero/empty values (`0`, `0.0`, all-zero label counts, empty
+    `DataFrame`) instead of raising or returning `None`, so a fresh
+    `data/monitoring.db` with zero conversations renders cleanly.
+- **`streamlit_app.py`:** the `make up`/`streamlit run` entrypoint. Calls
+  `src.db.knowledge_store.init_db()` and
+  `src.db.monitoring_store.init_db()` once at import time (both
+  idempotent `IF NOT EXISTS` DDL) before rendering anything, so the app
+  never crashes against a fresh/empty `data/` directory. `st.set_page_config`
+  + `st.title` + the two vertical sections in order (`render_qa_panel()`
+  then `render_dashboard()`), per spec section 13.1's single-page,
+  two-section layout.
+- **New `requirements.txt` entries (verified via PyPI JSON API, both
+  non-yanked as of 2026-08-27):** `streamlit==1.62.0` (latest,
+  `requires_python>=3.10`) and `pandas==3.0.5` (latest, `requires_python>=3.11`,
+  used explicitly in `dashboard.py` for `st.line_chart`/`st.bar_chart`
+  input shaping -- pinned directly even though it's also a transitive
+  streamlit dependency, per this repo's "every direct import gets its own
+  pin" convention). Streamlit's other transitive deps (altair, pydeck,
+  pyarrow, etc.) are left unpinned, same as this repo's existing precedent
+  for other packages' transitive dependencies.
+- **Runtime smoke-tested** (throwaway venv, `python-dotenv==1.2.3
+  pandas==3.0.5 streamlit==1.62.0` ONLY -- deliberately lighter than the
+  usual full-`requirements.txt` smoke tests, since `src.rag.generator`/
+  `src.rag.judge` were stubbed into `sys.modules` *before* importing
+  `src.app.qa_panel`, so importing it never pulls in the heavy
+  ONNX/transformers/openai/google-genai chain). Verified:
+  - `dashboard.py`'s 5 `_fetch_*` helpers against a seeded temp monitoring
+    DB (3 conversations with known cost/response_time/tokens; 2 `judge`
+    feedback rows [RELEVANT, NON_RELEVANT], 1 `eval_judge` row, 2 `user`
+    rows [+1, -1]): KPI math matched hand-computed values exactly; the
+    Judge Relevance Distribution correctly counted only the 2 `judge` rows
+    and completely excluded the `eval_judge` row; User Feedback Comparison
+    correctly showed up=1/down=1. A second empty temp DB (freshly
+    `init_db()`'d, zero rows) confirmed every helper returns clean
+    zero/empty values with no exceptions.
+  - `qa_panel.py`'s `_should_judge(sample_rate=0.0)` never True and
+    `_should_judge(sample_rate=1.0)` always True over 200 trials each;
+    `_maybe_judge()` calls `judge_answer()` iff `_should_judge()` is True,
+    and swallows (logs, does not raise) a simulated `judge_answer()`
+    failure; `_handle_feedback(conversation_id, +1/-1)` calls
+    `insert_feedback(conversation_id=..., source="user", score=+1/-1)`
+    exactly once each, verified via mock assertion. `config.JUDGE_SAMPLE_RATE`
+    confirmed `1.0` by default. All assertions passed. Temp venv, temp
+    monitoring DBs, and the throwaway smoke-test script all deleted
+    afterward (`git status --short` confirmed clean: only the intended
+    `requirements.txt`/`config.py` diffs plus the new untracked `src/app/`
+    package).
+- `pylanceFileSyntaxErrors` + `get_errors` clean on all four new/changed
+  files (`config.py`, `qa_panel.py`, `dashboard.py`, `streamlit_app.py`).
+  Dead-code grep (`print(`/`TODO`/`FIXME`/`pdb`/`breakpoint`) across
+  `src/app/`: zero hits.
+- **Self-review finding (fixed before the smoke test, not a separate
+  round):** the first draft of `qa_panel.py` inlined the judge-sampling
+  gate and the feedback-button `insert_feedback()` call directly inside
+  the `st.*`-calling render functions, which would have made them
+  untestable without a real Streamlit script context (`st.session_state`/
+  `st.button` raise outside one). Refactored into the three widget-free
+  helpers (`_should_judge`/`_maybe_judge`/`_handle_feedback`) described
+  above before running the smoke test, so the "testable logic separate
+  from rendering" requirement is met by construction, not by mocking
+  Streamlit itself.
+
+## src/app/streamlit_app.py -- follow-up review round (found and fixed a real bug)
+User asked for a second review pass after the initial `src/app/` build above.
+- **Real bug found:** `init_knowledge_db()`/`init_monitoring_db()` were
+  called as plain module-level statements. Streamlit re-executes the
+  *entire* script top-to-bottom on every widget interaction (every Submit
+  click, every +1/-1 click, etc.), so both `init_db()` calls -- each
+  opening a fresh sqlite3 connection and running several `CREATE TABLE IF
+  NOT EXISTS`/index/trigger statements -- were silently re-running on
+  EVERY single rerun, not just once at startup as the design decision said
+  ("calls both init_db()s once at startup"). Not a correctness bug
+  (idempotent DDL), but real, unnecessary DB round-trip overhead on every
+  interaction.
+- **Fix:** wrapped both calls in a `@st.cache_resource`-decorated
+  `_init_stores()` helper -- Streamlit's own supported mechanism for "run
+  once per server process, skip on every subsequent rerun" (distinct from
+  `@st.cache_data`, which caches return values keyed on arguments;
+  `@st.cache_resource` is for side-effecting singleton initialization like
+  this).
+- **Verified via a throwaway venv check** (streamlit+pandas only): wrapped
+  a call-counting function in `@st.cache_resource` and called it 5 times
+  in a loop (simulating 5 script reruns) -- confirmed the underlying
+  function body ran exactly once. Re-ran `pylanceFileSyntaxErrors`/
+  `get_errors` on `streamlit_app.py` -- clean.
+- **Also verified (previously untested gap):** the earlier smoke test only
+  exercised `dashboard.py`'s `_fetch_*` data-shaping helpers, never the
+  actual `st.line_chart`/`st.bar_chart` calls on the empty-store DataFrame
+  shapes those helpers produce. Ran a second throwaway check calling the
+  real `st.line_chart`/`st.bar_chart`/`st.metric` with the exact
+  empty-case DataFrames (0-row `columns=["cost"]`/`columns=["response_time"]`,
+  and the all-zero-count judge/feedback DataFrames) -- all rendered
+  without raising (only a harmless Altair `UserWarning` on the
+  genuinely-0-row charts about inferring vega-lite type from empty data,
+  purely cosmetic). Confirms the "handles an empty monitoring store
+  gracefully" claim is actually true, not just assumed.
+- No other new findings this round -- `qa_panel.py`'s sampling-gate/judge-
+  dispatch/feedback-dispatch separation and `dashboard.py`'s SQL/labels
+  were re-read line-by-line and remain correct. All throwaway venvs/scripts
+  from this review round deleted afterward; `git status --short` confirmed
+  clean scope (`docs/PROJECT_NOTES.md`, `requirements.txt`, `config.py`
+  modified + new untracked `src/app/`).
+
+## Cross-module static integration review #8 (final -- after src/app/, closes out spec.md's whole file tree)
+User asked whether another bug-hunt round was warranted after the two
+`src/app/` review rounds above; judged a third open-ended re-read as low
+value, and ran this repo's standard end-of-module integration checklist
+instead (see the "Reusable prompt: end-of-module review" entry earlier
+in this file).
+- **No import cycle:** grepped for `from src.app`/`import src.app`
+  anywhere in `src/` -- only `streamlit_app.py` itself imports from
+  `src.app` (`dashboard`/`qa_panel`); no other module imports `src.app`.
+  `src/app/` is a pure leaf consumer, dependency direction unchanged:
+  `config -> {db, llm, models_onnx} -> {ingestion, retrieval} ->
+  {rag, evaluation} -> app`.
+- **`__init__.py` audit:** all 9 packages (`src/`, `app/`, `db/`,
+  `evaluation/`, `ingestion/`, `llm/`, `models_onnx/`, `rag/`,
+  `retrieval/`) confirmed 0 bytes via direct byte-length check.
+- **Dead-code grep** (`print(`/`TODO`/`FIXME`/`pdb`/`breakpoint`) across
+  all of `src/`: still only the one already-judged-intentional
+  `print(load_info)` in `ingestion/pipeline.py` -- nothing new introduced
+  by `src/app/`.
+- **Signature matching, re-verified from scratch:** `GeneratedAnswer`'s
+  7 fields (`conversation_id`/`answer`/`prompt_tokens`/`completion_tokens`/
+  `total_tokens`/`latency_seconds`/`cost_usd`) match exactly what
+  `qa_panel._submit_query` reads; `insert_feedback(conversation_id,
+  source, score=None, label=None, explanation=None, db_path=...)` matches
+  `_handle_feedback`'s call exactly; `judge_answer(user_query, answer,
+  conversation_id, provider=None)` matches `_maybe_judge`'s call exactly.
+- **No new bugs found.** This closes out the integration review cycle for
+  the entire `src/` tree -- `src/app/` was the last package in spec.md's
+  file tree (section 13).
+
+## Cross-module static integration review #9 (full re-read, re-verified per user request after #8)
+User asked to run the repo's full formal "end-of-module review" prompt
+verbatim (re-read every file fresh, syntax-check every file individually,
+full requirements.txt audit) rather than trust review #8's lighter/
+targeted version. Executed the full checklist:
+- **Re-read all 25 substantive `src/` files in full, from scratch**
+  (config.py, db/knowledge_store.py+monitoring_store.py, ingestion's 3
+  files, llm's 4 files, models_onnx's 3 files, retrieval's 4 files,
+  rag's 2 files, evaluation's 3 files, app's 3 files) -- byte-for-byte
+  match what memory/docs already claimed; no hand-edits found.
+- **`pylanceFileSyntaxErrors` run individually on all 25** -- clean.
+- **Full `requirements.txt` audit** (grepped every `^import`/`^from` line
+  across all of `src/`): all 14 pinned packages (`python-dotenv`,
+  `sqlite-vec`, `dlt`, `pymupdf`, `optimum[onnxruntime]`, `transformers`,
+  `onnxruntime`, `numpy`, `openai`, `google-genai`, `pydantic`,
+  `tenacity`, `streamlit`, `pandas`) map to an actual import; nothing
+  unpinned, nothing pinned-but-unused.
+- **Import cycle / `__init__.py` audit**: reconfirmed clean (same result
+  as review #8, no changes since).
+- **New finding worth recording (not a bug, but a real risk that was
+  checked, not assumed):** `config.JUDGE_SAMPLE_RATE` (added for
+  `src/app/`) sits near `ACTIVE_RETRIEVAL_APPROACH`/`ACTIVE_ALPHA`/
+  `RRF_K`, which `evaluate_retrieval.py`'s `_replace_config_source()`
+  rewrites in-place via regex line-matching (`_ASSIGNMENT_PATTERNS`) and
+  requires byte-exact CRLF preservation elsewhere in the file. Explicitly
+  re-verified (byte-level regex count check) that `config.py` is still
+  100% CRLF (105/105 line endings, zero bare-LF) and that all three
+  `_ASSIGNMENT_PATTERNS` regexes still match their target lines exactly
+  -- the `JUDGE_SAMPLE_RATE` edit did not disturb this fragile
+  cross-module contract. Worth this explicit check any time a future
+  edit touches `config.py`, since `_replace_config_source()` raises
+  `RuntimeError` (not silent corruption) if a pattern ever stops
+  matching, but only at actual `make eval-retrieval` runtime.
+- **No new bugs found.** Codebase confirmed clean and stable; no further
+  review round planned unless new code is added.
+
+## TODO when building README.md (spec.md §15.1, matrix items #8/#9)
+Don't forget: items #8/#9 in the §16 traceability matrix require the
+`master_table.id` ground-truth rationale and the FK-extension
+future-proofing pattern to be explained **in the README**, not just in
+code comments (`db/knowledge_store.py` already documents both in-code).
+When writing README.md, include a section (or fold into the schema/
+data-model section) covering:
+- **Why `master_table.id` exists:** it's the "answer key" join column
+  the ground-truth methodology depends on -- `generate_ground_truth.py`
+  generates ~5 questions per record and pairs each with that record's
+  `id`; `evaluate_retrieval.py` later checks whether the correct `id`
+  appears in a question's retrieved results (Hit Rate/MRR). Link to the
+  spec's cited methodology:
+  https://github.com/DataTalksClub/llm-zoomcamp/blob/main/04-evaluation/lessons/03-ground-truth-batch.md
+- **Why `master_table` must never gain new columns directly:** future
+  MOSFET attributes (electrical/thermal specs, packaging, pricing) must
+  be added via new FK-linked extension tables referencing
+  `master_table.id` (worked example already in `knowledge_store.py`'s
+  comments), never by altering `master_table` itself -- keeps every
+  existing consumer of that table stable as the schema grows.
 </content>

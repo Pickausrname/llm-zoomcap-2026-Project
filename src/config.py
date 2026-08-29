@@ -62,6 +62,13 @@ GEMINI_MODEL: str = "gemini-2.5-flash"
 # evaluation (spec.md section 6.3): one of "openai" or "gemini".
 DEFAULT_LLM_PROVIDER: str = "openai"
 
+# Fraction of conversations the Streamlit app (app/qa_panel.py) auto-judges
+# via the live production relevance judge (spec.md sections 10.2/12.2).
+# 1.0 = judge every conversation (fully spec-compliant default -- the
+# dashboard's "Judge Relevance Distribution" chart populates from the first
+# query). Lower to reduce judge-LLM cost at scale; not exposed in the UI.
+JUDGE_SAMPLE_RATE: float = 1.0
+
 # ---------------------------------------------------------------------------
 # Retrieval parameters (spec.md section 9)
 # ---------------------------------------------------------------------------
