@@ -11,10 +11,9 @@ __pycache__/
 venv/
 env/
 
-# Generated data artifacts (spec.md: raw PDFs are downloaded separately per
-# README, everything else here is produced by make ingest/ground-truth/
-# eval-retrieval -- none of it is source, none of it should be committed)
-data/raw/*
+# Generated data artifacts (raw PDFs ARE committed under data/raw/ -- see
+# README section 7 -- everything below is produced by make ingest/ground-truth/
+# eval-retrieval and should not be committed)
 data/*.db
 data/*.db-journal
 data/*.db-wal

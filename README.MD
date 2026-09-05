@@ -277,13 +277,11 @@ question.)*
 
 ## 7. Dataset
 
-Raw datasheet PDFs live under `data/raw/` and are **not committed to
-git** (see `.gitignore`) — download the dataset and place the PDFs
-there before running `make ingest`:
+Raw datasheet PDFs live under [`data/raw/`](data/raw) and **are committed
+to this repository** — cloning the repo is sufficient, no separate
+download step is required before running `make ingest`:
 
-> **TODO (maintainer):** insert a direct link to a public Google Drive
-> folder or GitHub Release containing the raw MOSFET datasheet PDFs
-> here.
+> **Dataset:** [`data/raw/`](https://github.com/Pickausrname/llm-zoomcap-2026-Project/tree/main/data/raw) — 10 MOSFET datasheet PDFs (BSS138P, 2N7002NXAK, FDMC89521L, FDV301N, NX3020NAKW, SSM3K2615R, T2N7002AK, XP3N035N, RE1C002UNTCL, RK7002BMT116).
 
 Only the **first page** of each PDF is parsed (component type,
 manufacturer, part number, plus Descriptions/Features/Applications
@@ -317,13 +315,13 @@ Droplet, etc.):
    cp .env.example .env
    nano .env   # fill in OPENAI_API_KEY / GEMINI_API_KEY
    ```
-5. **Download the dataset** into `data/raw/` (see [§7](#7-dataset)).
-6. **Build and start the stack:**
+5. **Build and start the stack** (the dataset in `data/raw/` — see
+   [§7](#7-dataset) — comes with the clone, no separate download needed):
    ```bash
    docker compose build
    docker compose up -d
    ```
-7. **Run the offline pipeline once** (ingestion, ground truth, evaluation)
+6. **Run the offline pipeline once** (ingestion, ground truth, evaluation)
    inside the running container:
    ```bash
    docker compose exec app python -m src.ingestion.pipeline
@@ -331,8 +329,8 @@ Droplet, etc.):
    docker compose exec app python -m src.evaluation.evaluate_retrieval
    docker compose exec app python -m src.evaluation.evaluate_llm
    ```
-8. **Open the app** at `http://<vm-public-ip>:8501`.
-9. To update later: `git pull`, then `docker compose up -d --build`.
+7. **Open the app** at `http://<vm-public-ip>:8501`.
+8. To update later: `git pull`, then `docker compose up -d --build`.
 
 `./data` and `./models` are bind-mounted on the VM's local disk, so the
 knowledge base, monitoring database, and ONNX exports all persist across
