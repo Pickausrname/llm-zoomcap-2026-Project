@@ -38,7 +38,13 @@ _INSERT_SQL = (
 # retried batch were larger than one row we could re-insert already-committed
 # rows as duplicates after a partial failure (see dlt custom destination docs
 # on batch atomicity). One row per call keeps each insert independently retryable.
-@dlt.destination(name="knowledge_store_destination", batch_size=1, loader_file_format="jsonl")
+# loader_file_format="typed-jsonl": the installed dlt version (1.30.0) rejects
+# the plain "jsonl" format for custom destinations at runtime (raises
+# `ValueErrorWithKnownValues: Received invalid value preferred_format=jsonl.
+# Valid values are: ['typed-jsonl', 'parquet']`) -- "typed-jsonl" is dlt's
+# replacement that preserves the same per-row-dict semantics this destination
+# function expects.
+@dlt.destination(name="knowledge_store_destination", batch_size=1, loader_file_format="typed-jsonl")
 def knowledge_store_destination(items: TDataItems, table: TTableSchema) -> None:
     """
     Write a batch of `master_table` items straight into `data/knowledge.db`.

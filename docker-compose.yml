@@ -1,0 +1,24 @@
+# docker-compose.yml -- single-command orchestration for the MOSFET
+# Selection RAG stack (spec.md section 14.1).
+#
+# One `app` image is reused both as the long-lived Streamlit UI service and,
+# via `docker compose run --rm app <command>`, for one-off offline pipeline
+# stages (ingestion, ground-truth generation, evaluation) -- there is no
+# separate database server to orchestrate since the "knowledge base" and
+# "monitoring/logging databases" are just SQLite files under the bind-mounted
+# ./data volume, and model inference runs locally (CPU/ONNX) inside the same
+# container rather than as a separate service.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mosfet-rag-app
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    env_file:
+      - ./.env
+    restart: unless-stopped

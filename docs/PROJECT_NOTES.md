@@ -1836,4 +1836,199 @@ data-model section) covering:
   `master_table.id` (worked example already in `knowledge_store.py`'s
   comments), never by altering `master_table` itself -- keeps every
   existing consumer of that table stable as the schema grows.
+
+## Environment setup + first real (non-throwaway-venv) pipeline run (2026-08-30)
+First session where the code was actually run for real against this
+machine's own `.venv` and the real `data/raw/` PDFs, rather than a
+disposable smoke-test venv. Found and fixed two real bugs that no prior
+smoke test caught (both packages/behaviors had changed/were exercised
+differently than every prior throwaway-venv test).
+- **Machine had no Python at all** (only the non-functional Windows Store
+  stub). Installed Python 3.11.9 via
+  `winget install --id Python.Python.3.11 -e --silent --accept-package-agreements --accept-source-agreements --scope user`,
+  created `.venv` at repo root (`py -3.11 -m venv .venv`), installed all 14
+  pinned `requirements.txt` packages cleanly.
+- **Environment gap:** `onnxruntime` failed to import
+  (`ImportError: DLL load failed while importing onnxruntime_pybind11_state`)
+  until the Microsoft Visual C++ 2015-2022 Redistributable (x64) was
+  installed (`winget install --id Microsoft.VCRedist.2015+.x64 ...`). Not a
+  code bug, but blocks every module that transitively imports
+  `models_onnx.embedder`/`reranker` (i.e. most of `src/`) on a fresh Windows
+  machine -- worth calling out in a future README "prerequisites" section.
+- **Real bug #1 (`src/ingestion/pipeline.py`):** `@dlt.destination(...,
+  loader_file_format="jsonl")` — the installed dlt version (1.30.0) rejects
+  `"jsonl"` at runtime (`ValueErrorWithKnownValues: Received invalid value
+  preferred_format=jsonl. Valid values are: ['typed-jsonl', 'parquet']`),
+  so `make ingest`-equivalent (`python -m src.ingestion.pipeline`) failed
+  100% of the time with zero rows loaded. This was never caught by any
+  prior work because the ingestion pipeline had never actually been run
+  end-to-end against a real dlt install before this session (spec docs
+  were fetched to confirm the *decorator* API shape, but `pipeline.run()`
+  itself was never smoke-tested for real). Fixed: changed the value to
+  `"typed-jsonl"` (dlt's direct replacement, same per-row-dict semantics
+  the destination function already expects). Also had to manually delete
+  the stale `~/.dlt/pipelines/mosfet_datasheet_ingestion` working directory
+  (dlt leaves failed load packages pending for retry, which would have
+  retried the same broken-format package) before the corrected re-run.
+- **Real bug #2 (`src/ingestion/pdf_extractor.py`):** the heading matcher
+  in `_extract_section()` required an *exact* full-line match (after
+  lowercasing/colon-stripping) against a fixed heading-string list. Against
+  the actual 10 PDFs in `data/raw/`, this failed for **5 of 10** datasheets
+  (all `search_text` empty, hence no embedding -- `master_vec` had only 5/10
+  rows after the first real ingestion run), because:
+  - Nexperia-style datasheets number every heading, e.g. `"1.  General
+    description"`, `"2.  Features and benefits"`, `"3.  Applications"` --
+    neither the digit-prefix nor the "and benefits"/"Applications" (long
+    form) suffix matched the exact-string list.
+  - ROHM-style datasheets render a Wingdings-esque bullet glyph before each
+    heading that PyMuPDF's font-to-Unicode mapping turns into a literal
+    ASCII `"l"` with no space (`"lFeatures"`, `"lApplication"` -- singular,
+    not plural).
+  - Diagnosed by directly dumping `page.get_text()` for the failing PDFs
+    (not guessed) before writing a fix.
+  - **Fix:** added `_normalize_heading_line()` (strips a `^\d+\.\s*`
+    numbered-list prefix and a stray leading `l` immediately followed by a
+    lowercase letter, in addition to the existing colon-strip/lowercase)
+    and `_is_heading_match()` (exact match OR `startswith(heading + " ")`,
+    so "features and benefits" matches the "features" variant). Section
+    *end* boundaries (`_is_section_boundary()`) now also treat **any**
+    numbered heading line (`^\d+\.\s*\S`, e.g. Nexperia's later "4.  Quick
+    reference data") as a boundary, not just our three target headings --
+    otherwise an "Applications" capture on a numbered datasheet would run
+    past its real end and swallow the next unrelated section. Added
+    `"application"` (singular) to the `applications` heading-variant tuple
+    to match ROHM's `"lApplication"` after bullet-stripping.
+  - **Result after the fix:** 9 of 10 PDFs now produce non-empty
+    `search_text`/embeddings (`master_vec` rows: 5 -> 9). The one remaining
+    empty record, `T2N7002AK_datasheet_en_20150401.pdf`, has a
+    structurally different cover page with **no section headings at all**
+    (an inline "○ High Speed Switching Applications" line, then bare `"•"`
+    bullets with no "Features"/"Applications" label). Deliberately NOT
+    fixed further this session -- handling a header-less layout would need
+    a materially different heuristic (e.g. treat all bullets as "features"
+    by default), which risks regressing the 9 datasheets that now work
+    correctly, and was judged out of scope for a single edge-case PDF.
+    Documented here as a known, real limitation rather than silently
+    accepted.
+- Both fixes verified against the real `data/raw/` PDFs (not synthetic
+  test data): re-ran `python -m src.ingestion.pipeline` end-to-end after
+  clearing the stale `knowledge.db`/dlt pipeline state, confirmed
+  `master_table` has exactly 10 rows, `master_fts` has 10 rows, `master_vec`
+  has 9 rows, and the dlt load package reports "LOADED and contains no
+  failed jobs". `pylanceFileSyntaxErrors`/`get_errors` clean on
+  `pdf_extractor.py` after the edit.
+- **Next step after this:** generate `data/ground_truth.csv` (real LLM
+  calls, small cost) and run `evaluate_retrieval.py`/`evaluate_llm.py`
+  (real LLM calls, larger cost) against this real, now-9/10-populated
+  knowledge base.
+
+## Ground truth generation + evaluate_retrieval.py + evaluate_llm.py — first real runs (2026-08-30)
+Ran the remaining evaluation steps for real for the first time, after the
+user manually hand-edited `search_text` for 6 rows (ids 4, 6, 7, 8, 9, 10)
+and they were re-embedded (`scripts/reembed_rows.py`, a new small helper
+script -- see below), bringing `master_vec` to 10/10 rows.
+- `generate_ground_truth.py`: ran cleanly, one structured-output call per
+  `master_table` row (10 calls, `DEFAULT_LLM_PROVIDER="openai"`), wrote
+  50 rows (5 questions x 10 records) to `data/ground_truth.csv`.
+- `evaluate_retrieval.py`: ran cleanly (no LLM calls, as designed). All 14
+  (approach, variant) rows scored; winner picked was `hybrid_rerank`,
+  `alpha=0.0` (hit_rate=1.0, MRR=0.93), and `src/config.py`'s
+  `ACTIVE_RETRIEVAL_APPROACH`/`ACTIVE_ALPHA` were rewritten in place as
+  designed. **Notable non-bug finding:** all 11 alpha values (0.0-1.0)
+  scored *identically* (hit_rate=1.0, MRR=0.93) -- with only a 10-document
+  corpus, every alpha's hybrid-retrieval candidate pool is small enough
+  that the cross-encoder reranker ends up fully determining the final
+  ranking regardless of the lexical/vector fusion weight. Not a bug; just
+  means this alpha sweep isn't discriminating anything meaningful at this
+  corpus size. Worth re-checking once the corpus is larger.
+- **Real bug found (`src/llm/gemini_client.py`): no client-side rate
+  limiting for Gemini's free-tier quota (5 requests/minute per project,
+  confirmed from the actual `429 RESOURCE_EXHAUSTED` error body).**
+  `evaluate_llm.py` runs a `ThreadPoolExecutor` batch of up to 50
+  concurrent rows per model (spec.md 11.4 "sequential-per-model,
+  parallel-within-model"), and `src.llm.factory.get_llm()` constructs a
+  brand-new `GeminiClient` instance per call, so nothing throttled the
+  burst of near-simultaneous requests. Result on the first real run: only
+  6 of 50 rows (12%) were successfully judged for EACH model (44/50
+  hit the 429 and were counted as failures) -- both when Gemini was the
+  model being evaluated (generation) and when Gemini was the
+  cross-grading judge for OpenAI's answers. The existing `tenacity` retry
+  (`_retry_gemini`: `wait_exponential(min=2, max=10)`, `stop_after_attempt(4)`)
+  wasn't enough to survive this, since dozens of threads each retry
+  independently and collectively keep re-triggering the quota.
+  Winner was selected (`openai`, 83.3% vs 66.7%) but on an n=6 sample per
+  model -- not a trustworthy signal. Total run cost was low (~$0.013
+  combined), so nothing expensive was wasted, but the comparison itself
+  needed a re-run.
+  - **Fix:** added a process-wide rate limiter to `gemini_client.py` --
+    a module-level `threading.Lock` + last-call timestamp shared by every
+    `GeminiClient` instance, serializing real outbound Gemini requests to
+    at most one every 12.5 seconds (5 req/min quota = 1 per 12s, padded
+    for jitter). Applied in both `complete()` and `structured()`, called
+    fresh on every attempt (so `tenacity` retries are paced too, not just
+    the first try). This is a deliberate wall-clock-time-for-correctness
+    tradeoff: a full 50-row Gemini-involving batch now takes minutes
+    instead of seconds, but actually respects the account-wide quota
+    instead of retry-storming it. OpenAI's client was untouched --
+    OpenAI's own generation calls never hit a rate limit in this run;
+    only Gemini did (both as generator and as cross-grading judge).
+  - Not yet re-run against this fix as of this note (re-running the full
+    `evaluate_llm.py` costs a few more real dollars and will take longer
+    wall-clock time now, given the new throttle -- pending explicit user
+    approval before each run, as per this project's standing convention).
+- **Second real bug found (same day, after the rate-limiter fix above):
+  Gemini free tier ALSO has a separate daily cap, not just per-minute.**
+  Re-running `evaluate_llm.py` the same day (with the per-minute
+  throttle correctly in place) still failed almost immediately with a
+  DIFFERENT 429 body: `GenerateRequestsPerDayPerProjectPerModel-FreeTier`,
+  `quotaValue: 20` -- only 20 Gemini requests/day, already exhausted by
+  the first (badly-rate-limited) run's ~100+ attempted calls earlier that
+  day. No amount of client-side pacing can fix a hard daily cap -- killed
+  the run immediately rather than let it retry-storm uselessly (each
+  retry still burns real OpenAI-side generation cost for pairs whose
+  Gemini half is guaranteed to fail). A full run needs ~100 Gemini calls
+  (50 as generator for Gemini's own batch + 50 as cross-grading judge for
+  OpenAI's batch) -- far more than 20/day, so a full free-tier run can
+  never complete in a single day regardless of timing.
+  - **Resolution:** user upgraded to a paid Gemini API tier (removes the
+    daily cap). Verified via a single minimal probe call
+    (`GeminiClient().complete("Say OK.")`) before committing to a full
+    re-run -- succeeded immediately.
+  - **Final, reliable re-run (2026-08-31), full 50-row ground truth,
+    both models:**
+
+    | Model  | n_judged | n_failures | Accuracy | Cost      | Avg latency |
+    |--------|----------|------------|----------|-----------|-------------|
+    | openai | 49/50    | 1          | 85.71%   | $0.01347  | 1.45s       |
+    | gemini | 50/50    | 0          | 86.00%   | $0.01494  | 5.92s       |
+
+    Winner: **gemini** (accuracy desc, then failure count asc, then cost
+    asc) -- but the two models are within 0.3 percentage points of each
+    other, effectively a toss-up on this dataset; only the zero-failures
+    tiebreaker separates them. `evaluate_llm.py` deliberately does NOT
+    write back to `src/config.py` (unlike `evaluate_retrieval.py`) -- a
+    human decision, left as `DEFAULT_LLM_PROVIDER="openai"` for now
+    pending further consideration, not automatically switched to
+    `"gemini"` despite it winning this run.
+    Failure analysis (root cause of "bad" verdicts): openai = 6
+    hallucination + 1 irrelevant_context; gemini = 5 hallucination + 2
+    irrelevant_context.
+- **New helper scripts added this session** (not part of the original
+  spec.md `src/` tree, but reusable dev tools going forward):
+  - `scripts/update_row.py <id> <column> <value>`: safely edits one
+    `master_table` column for one row via `src.db.knowledge_store.connect()`
+    (so FTS5/vec0 sync triggers fire correctly) -- created after
+    PowerShell console quoting made inline `python -c "..."` UPDATE
+    statements unreliable to type/paste directly.
+  - `scripts/reembed_rows.py <id> [<id> ...]`: re-embeds `search_vector`
+    for specific rows from their *current* `search_text` (e.g. after a
+    manual edit via `update_row.py`), through the same `connect()` path
+    so `master_vec`'s sync trigger stays consistent. Both scripts insert
+    the repo root onto `sys.path` manually, since running a `scripts/*.py`
+    file directly (not via `-m`) only puts `scripts/` itself on
+    `sys.path`, not the repo root -- `import src...` would otherwise fail
+    regardless of the shell's current working directory.
+
+
+
 </content>

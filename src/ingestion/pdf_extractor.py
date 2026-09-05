@@ -52,7 +52,7 @@ _EMPTY_FIELDS: Final[ExtractedFields] = {
 _SECTION_HEADINGS: Final[dict[str, tuple[str, ...]]] = {
 	"descriptions": ("description", "general description", "product description"),
 	"features": ("features", "key features"),
-	"applications": ("applications", "typical applications"),
+	"applications": ("applications", "typical applications", "application"),
 }
 
 # Union of every heading variant, used to detect where a section ends
@@ -60,6 +60,40 @@ _SECTION_HEADINGS: Final[dict[str, tuple[str, ...]]] = {
 _ALL_HEADINGS: Final[set[str]] = {
 	heading for variants in _SECTION_HEADINGS.values() for heading in variants
 }
+
+# Some vendors (e.g. Nexperia) number every cover-page section heading
+# ("1.  General description", "2.  Features and benefits", "3.  Applications").
+# Others (e.g. ROHM) render a Wingdings-style bullet glyph before each heading
+# that PyMuPDF's font-to-Unicode mapping turns into a literal ASCII "l"
+# ("lFeatures", "lApplication"). Both defeat a plain exact-line-match against
+# `_SECTION_HEADINGS`, so headings are normalized before comparison.
+_NUMBERED_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"^\d+\.\s*")
+_STRAY_BULLET_RE: Final[re.Pattern[str]] = re.compile(r"^l(?=[a-z])")
+# Any numbered heading line (any vendor's section, not just the three above)
+# also marks a section boundary -- e.g. Nexperia's "4.  Quick reference data"
+# must stop an "Applications" capture even though it isn't itself one of our
+# target fields.
+_ANY_NUMBERED_HEADING_RE: Final[re.Pattern[str]] = re.compile(r"^\d+\.\s*\S")
+
+
+def _normalize_heading_line(line: str) -> str:
+	"""Lowercase a raw PDF line and strip a numbered-list prefix or stray bullet glyph, for heading comparison."""
+	text = line.strip().strip(":").lower()
+	text = _NUMBERED_PREFIX_RE.sub("", text)
+	text = _STRAY_BULLET_RE.sub("", text)
+	return text
+
+
+def _is_heading_match(normalized: str, headings: tuple[str, ...]) -> bool:
+	"""True if `normalized` names one of `headings`, exactly or as a longer heading-plus-subtitle line (e.g. "features and benefits")."""
+	return any(normalized == heading or normalized.startswith(heading + " ") for heading in headings)
+
+
+def _is_section_boundary(raw_line: str, normalized: str) -> bool:
+	"""True if `raw_line`/`normalized` looks like the start of ANY section (ours or not)."""
+	if _is_heading_match(normalized, tuple(_ALL_HEADINGS)):
+		return True
+	return bool(_ANY_NUMBERED_HEADING_RE.match(raw_line.strip()))
 
 _COMPONENT_TYPE_PATTERNS: Final[tuple[str, ...]] = (
 	r"N-Channel(?:\s+Enhancement\s+Mode)?\s+MOSFET",
@@ -111,13 +145,13 @@ def _extract_section(lines: list[str], headings: tuple[str, ...]) -> str:
 	stopping at the next line that matches any known section heading.
 	"""
 	for idx, line in enumerate(lines):
-		normalized = line.strip().strip(":").lower()
-		if normalized not in headings:
+		normalized = _normalize_heading_line(line)
+		if not _is_heading_match(normalized, headings):
 			continue
 		captured: list[str] = []
 		for later_line in lines[idx + 1 :]:
-			later_normalized = later_line.strip().strip(":").lower()
-			if later_normalized in _ALL_HEADINGS:
+			later_normalized = _normalize_heading_line(later_line)
+			if _is_section_boundary(later_line, later_normalized):
 				break
 			if later_normalized:
 				captured.append(later_line)

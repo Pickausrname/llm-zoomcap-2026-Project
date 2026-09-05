@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 
 from google import genai
@@ -39,6 +40,39 @@ _retry_gemini = retry(
     reraise=True,
 )
 
+# ---------------------------------------------------------------------------
+# Process-wide rate limiter (bug fix, spec.md section 11.4 evaluation run).
+#
+# The Google Gemini free tier caps `gemini-2.5-flash` at 5 requests/minute
+# PER PROJECT (i.e. shared across every concurrent caller, not per-client).
+# `evaluate_llm.py` runs a `ThreadPoolExecutor` batch of up to 50 concurrent
+# rows, and `src.llm.factory.get_llm()` constructs a brand-new `GeminiClient`
+# instance per call -- so a per-instance throttle would do nothing; dozens of
+# threads each fired their own request immediately, blowing through the quota
+# in the first few seconds and exhausting `_retry_gemini`'s 4 attempts before
+# the free-tier's own ~12s replenishment window could help.
+#
+# Fix: a single module-level lock + last-call timestamp, shared by every
+# `GeminiClient` instance in this process, serializes real outbound Gemini
+# requests to at most one every `_MIN_CALL_INTERVAL_SECONDS`. This trades
+# wall-clock time (a full 50-row batch now takes minutes, not seconds) for
+# actually respecting the account-wide quota instead of retry-storming it.
+_gemini_rate_limit_lock = threading.Lock()
+_gemini_last_call_monotonic: float = 0.0
+# 5 requests/minute = 1 every 12s; pad slightly for clock/latency jitter.
+_MIN_CALL_INTERVAL_SECONDS: float = 12.5
+
+
+def _throttle_gemini_call() -> None:
+    """Block the calling thread until it's safe to fire another Gemini request."""
+    global _gemini_last_call_monotonic
+    with _gemini_rate_limit_lock:
+        now = time.monotonic()
+        wait_seconds = _gemini_last_call_monotonic + _MIN_CALL_INTERVAL_SECONDS - now
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        _gemini_last_call_monotonic = time.monotonic()
+
 
 class GeminiClient(LLMClient):
     """`LLMClient` implementation backed by the Google GenAI SDK."""
@@ -63,6 +97,7 @@ class GeminiClient(LLMClient):
         """Generate free-form text via `models.generate_content`."""
         config = types.GenerateContentConfig(system_instruction=system, **kwargs)
 
+        _throttle_gemini_call()
         start = time.monotonic()
         response = self._client.models.generate_content(
             model=self.model,
@@ -94,6 +129,7 @@ class GeminiClient(LLMClient):
             **kwargs,
         )
 
+        _throttle_gemini_call()
         start = time.monotonic()
         response = self._client.models.generate_content(
             model=self.model,

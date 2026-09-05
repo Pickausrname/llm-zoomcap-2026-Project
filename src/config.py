@@ -92,7 +92,7 @@ ALPHA: float = 0.5
 # production retrieval pipeline reads these two values at call time, so
 # updating them here is enough to change production behavior.
 ACTIVE_RETRIEVAL_APPROACH: str = APPROACH_HYBRID_RERANK
-ACTIVE_ALPHA: float = ALPHA
+ACTIVE_ALPHA: float = 0.0
 
 # ---------------------------------------------------------------------------
 # LLM pricing (USD per 1K tokens), used for cost estimation in the LLM
